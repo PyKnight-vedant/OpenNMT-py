@@ -1,4 +1,5 @@
 """ Optimizers class """
+import math
 import torch
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
@@ -55,7 +56,8 @@ def build_torch_optimizer(model, opt):
             params, non_constant_decay=True, enable_factorization=True, weight_decay=0
         )
     elif opt.optim == "adam":
-        optimizer = optim.Adam(params, lr=opt.learning_rate, betas=betas, eps=1e-8)
+        optimizer = optim.Adam(
+            params, lr=opt.learning_rate, betas=betas, eps=1e-8)
     elif opt.optim == "sparseadam":
         dense = []
         sparse = []
@@ -70,7 +72,8 @@ def build_torch_optimizer(model, opt):
         optimizer = MultipleOptimizer(
             [
                 optim.Adam(dense, lr=opt.learning_rate, betas=betas, eps=1e-8),
-                optim.SparseAdam(sparse, lr=opt.learning_rate, betas=betas, eps=1e-8),
+                optim.SparseAdam(sparse, lr=opt.learning_rate,
+                                 betas=betas, eps=1e-8),
             ]
         )
     elif opt.optim == "fusedadam":
@@ -484,8 +487,10 @@ class AdaFactor(torch.optim.Optimizer):
         else:
             tmp_div = len(temp_shape) // 2 + len(temp_shape) % 2
             new_shape = (
-                shape[0] * functools.reduce(operator.mul, temp_shape[tmp_div:], 1),
-                shape[1] * functools.reduce(operator.mul, temp_shape[:tmp_div], 1),
+                shape[0] *
+                functools.reduce(operator.mul, temp_shape[tmp_div:], 1),
+                shape[1] *
+                functools.reduce(operator.mul, temp_shape[:tmp_div], 1),
             )
         return new_shape, copy(shape)
 
@@ -525,7 +530,8 @@ class AdaFactor(torch.optim.Optimizer):
                 is_matrix, is_need_reshape = self._check_shape(grad.size())
                 new_shape = p.data.size()
                 if is_need_reshape and group["enable_factorization"]:
-                    new_shape, old_shape = self._experimental_reshape(p.data.size())
+                    new_shape, old_shape = self._experimental_reshape(
+                        p.data.size())
                     grad = grad.view(new_shape)
 
                 state = self.state[p]
@@ -648,8 +654,8 @@ class AdaFactor(torch.optim.Optimizer):
 
 class FusedAdam(torch.optim.Optimizer):
 
-    """Implements Adam algorithm. Currently GPU-only.
-       Requires Apex to be installed via
+    """Implements Adam algorithm with cosine annealing and early stopping.
+       Currently GPU-only. Requires Apex to be installed via
        ``python setup.py install --cuda_ext --cpp_ext``.
 
     Arguments:
@@ -669,6 +675,9 @@ class FusedAdam(torch.optim.Optimizer):
             adds eps to the bias-corrected second moment estimate before
             evaluating square root instead of adding it to the square root of
             second moment estimate as in the original paper. (default: False)
+        max_iters (int, optional): maximum number of iterations for cosine annealing (default: 1000)
+        min_lr (float, optional): minimum learning rate for cosine annealing (default: 0.0)
+        patience (int, optional): number of epochs to wait for improvement before triggering early stopping (default: 6)
     """
 
     def __init__(
@@ -682,6 +691,9 @@ class FusedAdam(torch.optim.Optimizer):
         weight_decay=0.0,
         max_grad_norm=0.0,
         amsgrad=False,
+        max_iters=1000,  # Maximum iterations for cosine annealing
+        min_lr=0.0,       # Minimum learning rate
+        patience=6,      # Number of epochs to wait before early stopping
     ):
         global fused_adam_cuda
         fused_adam_cuda = importlib.import_module("fused_adam_cuda")
@@ -698,6 +710,11 @@ class FusedAdam(torch.optim.Optimizer):
         )
         super(FusedAdam, self).__init__(params, defaults)
         self.eps_mode = 0 if eps_inside_sqrt else 1
+        self.max_iters = max_iters
+        self.min_lr = min_lr
+        self.patience = patience
+        self.counter = 0
+        self.best_loss = float('inf')
 
     def step(
         self, closure=None, grads=None, output_params=None, scale=1.0, grad_norms=None
@@ -724,7 +741,6 @@ class FusedAdam(torch.optim.Optimizer):
         if grads is None:
             grads_group = [None] * len(self.param_groups)
         # backward compatibility
-        # assuming a list/generator of parameter means single group
         elif isinstance(grads, types.GeneratorType):
             grads_group = [grads]
         elif type(grads[0]) != list:
@@ -752,10 +768,9 @@ class FusedAdam(torch.optim.Optimizer):
             if output_params_this_group is None:
                 output_params_this_group = [None] * len(group["params"])
 
-            # compute combined scale factor for this group
+            # Compute combined scale factor for this group
             combined_scale = scale
             if group["max_grad_norm"] > 0:
-                # norm is in fact norm*scale
                 clip = ((grad_norm / scale) + 1e-6) / group["max_grad_norm"]
                 if clip > 1:
                     combined_scale = clip * scale
@@ -765,17 +780,13 @@ class FusedAdam(torch.optim.Optimizer):
             for p, grad, output_param in zip(
                 group["params"], grads_this_group, output_params_this_group
             ):
-                # note: p.grad should not ever be set for correct operation of
-                # mixed precision optimizer that sometimes sends None gradients
                 if p.grad is None and grad is None:
                     continue
                 if grad is None:
                     grad = p.grad.data
                 if grad.is_sparse:
                     raise RuntimeError(
-                        "FusedAdam does not support sparse \
-                                       gradients, please consider \
-                                       SparseAdam instead"
+                        "FusedAdam does not support sparse gradients, please consider SparseAdam instead"
                     )
 
                 state = self.state[p]
@@ -783,13 +794,19 @@ class FusedAdam(torch.optim.Optimizer):
                 # State initialization
                 if len(state) == 0:
                     state["step"] = 0
-                    # Exponential moving average of gradient values
                     state["exp_avg"] = torch.zeros_like(p.data)
-                    # Exponential moving average of squared gradient values
                     state["exp_avg_sq"] = torch.zeros_like(p.data)
 
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
                 beta1, beta2 = group["betas"]
+
+                # Calculate learning rate with cosine annealing
+                current_iter = state["step"]
+                if current_iter <= self.max_iters:
+                    lr_t = self.min_lr + 0.5 * (group["lr"] - self.min_lr) * \
+                        (1 + math.cos(math.pi * current_iter / self.max_iters))
+                else:
+                    lr_t = self.min_lr
 
                 state["step"] += 1
 
@@ -804,7 +821,7 @@ class FusedAdam(torch.optim.Optimizer):
                     exp_avg,
                     exp_avg_sq,
                     grad,
-                    group["lr"],
+                    lr_t,  # Use the dynamically calculated learning rate
                     beta1,
                     beta2,
                     group["eps"],
@@ -814,4 +831,16 @@ class FusedAdam(torch.optim.Optimizer):
                     bias_correction,
                     group["weight_decay"],
                 )
+
+        # Early Stopping based on loss
+        if loss is not None:
+            if loss < self.best_loss:
+                self.best_loss = loss
+                self.counter = 0  # Reset counter if improvement is seen
+            else:
+                self.counter += 1  # Increment counter if no improvement
+                if self.counter >= self.patience:
+                    print("Early stopping triggered.")
+                    return True  # Indicate that early stopping should occur
+
         return loss
